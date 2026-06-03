@@ -247,12 +247,7 @@ class Qwen2_5_VLForConditionalGeneration_X(Qwen2VLForConditionalGeneration):
                 position_ids = position_ids.add(delta)
                 position_ids = position_ids.unsqueeze(0).expand(3, -1, -1)
                 
-        # ================= [修改位置：打印进入 LLM 前的 Image Token 数] =================
-        # self.model.n_image_tokens 在上方的逻辑中（约第483行）已经被更新为
-        # 经过 window_selection 和 token_merging 后的最终数量
-        
-        # 修改点：增加 input_ids.shape[1] > 1 的判断
-        # 只有在第一步（Prefill）时长度才大于1，后续生成时长度都为1，从而屏蔽刷屏
+
         if input_ids is not None and input_ids.shape[1] > 1:
             print(f"--------")
             print(f"[DEBUG] Image Tokens Entering LLM: {self.model.n_image_tokens}")
@@ -912,10 +907,370 @@ class Qwen2_5_VLModel_X(Qwen2_5_VLPreTrainedModel):
         )
 
     # =========================
-    # layer_prune (your PIO variant)
+    # layer_prune (your GradCrop variant)
     # =========================
-    def PIO_layer_prune
-      
+    def layer_prune(
+        self,
+        cur_num,
+        rank_layer,             # 1-based layer index
+        features,
+        position_ids,           # (3,B,S) usually
+        attention_mask,         # EXPECT 2D (B,S) bool/int, NOT causal_mask
+        position_embeddings,    # MUST be passed into Qwen2.5-VL layer/self_attn
+        cur_image_tokens,
+        next_image_tokens,
+    ):
+        from contextlib import nullcontext
+        import numpy as np
+        import torch
+        import torch.nn.functional as F
+
+        _position_ids = position_ids
+        _attention_mask = attention_mask
+
+        device = features.device
+        dtype_hidden = features.dtype
+        bsz, seq_len, hidden_dim = features.shape
+
+        # ---- position_ids fallback ----
+        # Qwen expects (3,B,S)
+        if position_ids is None:
+            pos_1d = torch.arange(seq_len, device=device, dtype=torch.long)
+            position_ids = pos_1d.view(1, 1, -1).expand(3, bsz, -1)
+
+        # ---- attention_mask fallback (2D, only for last-K valid positions + packing) ----
+        attn_2d = None
+        if attention_mask is None:
+            attn_2d = torch.ones((bsz, seq_len), dtype=torch.bool, device=device)
+            attention_mask = attn_2d
+        else:
+            if torch.is_tensor(attention_mask) and attention_mask.dim() == 2:
+                attn_2d = attention_mask.bool()
+                attention_mask = attn_2d
+            else:
+                # unknown shape -> do not use for pos_mask
+                attn_2d = None
+
+        # ---- image span ----
+        image_start_index = self.image_start_index
+        img_start = int(image_start_index.item()) if torch.is_tensor(image_start_index) else int(image_start_index)
+
+        img_len = int(cur_image_tokens)
+        img_end = img_start + img_len
+
+        keep_length = int(next_image_tokens)
+        keep_length = max(0, min(keep_length, img_len))
+
+        print(
+            f"[DEBUG] layer {rank_layer}: image_tokens(before)={img_len}, keep_length(after)={keep_length}"
+        )
+
+        # trivial / invalid
+        if img_len <= 0 or keep_length <= 0 or img_start < 0 or img_end > seq_len:
+            grad_scores_img = torch.empty((0,), dtype=torch.float32, device=device)
+            top_rank_index_x = torch.empty((0,), dtype=torch.long, device=device)
+            return position_ids, attention_mask, features, grad_scores_img, top_rank_index_x
+
+        if keep_length >= img_len:
+            grad_scores_img = torch.zeros((img_len,), dtype=torch.float32, device=device)
+            top_rank_index_x = torch.arange(img_len, dtype=torch.long, device=device)
+            return position_ids, attention_mask, features, grad_scores_img, top_rank_index_x
+
+        # =========================
+        # output head getter
+        # =========================
+        def _get_output_head():
+            if hasattr(self, "lm_head") and self.lm_head is not None:
+                return self.lm_head
+            if hasattr(self, "get_output_embeddings"):
+                head = self.get_output_embeddings()
+                if head is not None:
+                    return head
+            if hasattr(self, "embed_tokens") and self.embed_tokens is not None:
+                W = self.embed_tokens.weight
+
+                def _tied_head(x):
+                    return F.linear(x, W)
+                return _tied_head
+
+            raise RuntimeError("Cannot locate output head (lm_head/get_output_embeddings/embed_tokens).")
+
+        output_head = _get_output_head()
+        norm_mod = self.norm if hasattr(self, "norm") and self.norm is not None else None
+
+        # =========================
+        # proxy loss on current layer
+        # =========================
+        def _loss_on_current_layer(start_layer_1based, cur_hidden, cur_attention_mask_2d, cur_position_ids, cur_position_embeddings):
+            loss_mode = "multi_pos"
+            K_pos = 4
+            T_temp = 0.7
+            mix_alpha = 0.5
+
+            K_pos = max(1, int(K_pos))
+            T_temp = max(1e-3, float(T_temp))
+            mix_alpha = float(min(max(mix_alpha, 0.0), 1.0))
+
+            # ✅ FIX: 1-based -> 0-based, clamp to valid range
+            start_layer_0 = int(start_layer_1based) - 1
+            start_layer_0 = max(0, min(start_layer_0, len(self.layers) - 1))
+            layer = self.layers[start_layer_0]
+
+            out = layer(
+                hidden_states=cur_hidden,
+                attention_mask=None,  # keep lightweight
+                position_ids=cur_position_ids,
+                position_embeddings=cur_position_embeddings,
+                past_key_value=None,
+                output_attentions=False,
+                use_cache=False,
+            )
+            h = out[0]  # (B,S,D)
+
+            if norm_mod is not None:
+                h = norm_mod(h)
+
+            logits = output_head(h)  # (B,S,V)
+
+            shift_logits = logits[..., :-1, :].contiguous()  # (B,S-1,V)
+            B, S1, V = shift_logits.shape
+            shift_logits_f = shift_logits.float()
+
+            pos_mask = torch.zeros((B, S1), dtype=torch.bool, device=shift_logits.device)
+
+            if cur_attention_mask_2d is not None:
+                shift_mask = cur_attention_mask_2d[..., 1:].contiguous().bool()  # (B,S-1)
+                valid_len = shift_mask.long().sum(dim=1)
+                for b in range(B):
+                    L = int(valid_len[b].item())
+                    if L <= 0:
+                        pos_mask[b, S1 - 1] = True
+                        continue
+                    for t in range(K_pos):
+                        kpos = max(0, min(S1 - 1, L - 1 - t))
+                        pos_mask[b, kpos] = True
+            else:
+                for b in range(B):
+                    for t in range(K_pos):
+                        kpos = max(0, S1 - 1 - t)
+                        pos_mask[b, kpos] = True
+
+            pseudo = shift_logits_f.detach().argmax(dim=-1)
+            IGNORE_LOCAL = -100
+            shift_labels = torch.full_like(pseudo, IGNORE_LOCAL)
+            shift_labels = torch.where(pos_mask, pseudo, shift_labels)
+
+            # (keep your branches)
+            if loss_mode in ("orig", "multi_pos"):
+                return F.cross_entropy(
+                    shift_logits_f.view(-1, V),
+                    shift_labels.view(-1),
+                    ignore_index=IGNORE_LOCAL,
+                    reduction="mean",
+                )
+
+            if loss_mode == "soft_kd":
+                logp = F.log_softmax(shift_logits_f / T_temp, dim=-1)
+                with torch.no_grad():
+                    p_t = F.softmax(shift_logits_f / T_temp, dim=-1)
+                kl = F.kl_div(logp, p_t, reduction="none").sum(-1) * (T_temp * T_temp)
+                denom = pos_mask.sum().clamp_min(1)
+                return (kl.masked_fill(~pos_mask, 0.0).sum() / denom).float()
+
+            if loss_mode == "hybrid":
+                ce = F.cross_entropy(
+                    shift_logits_f.view(-1, V),
+                    shift_labels.view(-1),
+                    ignore_index=IGNORE_LOCAL,
+                    reduction="mean",
+                )
+                logp = F.log_softmax(shift_logits_f / T_temp, dim=-1)
+                with torch.no_grad():
+                    p_t = F.softmax(shift_logits_f / T_temp, dim=-1)
+                kl = F.kl_div(logp, p_t, reduction="none").sum(-1) * (T_temp * T_temp)
+                denom = pos_mask.sum().clamp_min(1)
+                kl = (kl.masked_fill(~pos_mask, 0.0).sum() / denom).float()
+                return mix_alpha * ce + (1.0 - mix_alpha) * kl
+
+            return F.cross_entropy(
+                shift_logits_f.view(-1, V),
+                shift_labels.view(-1),
+                ignore_index=IGNORE_LOCAL,
+                reduction="mean",
+            )
+
+        # =========================
+        # compute grads w.r.t. layer input features
+        # =========================
+        try:
+            infer_ctx = torch.inference_mode(False)
+        except TypeError:
+            infer_ctx = nullcontext()
+
+        with infer_ctx, torch.enable_grad():
+            target_dtype = next(self.parameters()).dtype
+            probe_in = features.to(target_dtype).detach()
+            probe_in.requires_grad_(True)
+
+            # autocast (optional)
+            try:
+                from torch import amp as _amp
+                ac = _amp.autocast(device_type="cuda", dtype=target_dtype)
+            except Exception:
+                ac = nullcontext()
+
+            with ac:
+                total_loss = _loss_on_current_layer(
+                    rank_layer, probe_in, attn_2d, position_ids, position_embeddings
+                )
+
+            if (not torch.is_tensor(total_loss)) or (not total_loss.requires_grad):
+                raise RuntimeError(
+                    "[GradCrop] total_loss.requires_grad=False. Still in inference_mode or graph broken."
+                )
+
+            grads = torch.autograd.grad(
+                total_loss,
+                probe_in,
+                retain_graph=False,
+                create_graph=False,
+                allow_unused=False,
+            )[0]  # (B,S,D)
+
+        # =========================
+        # token scoring & selection
+        # =========================
+        enable_nms = True
+        tau = 0.8
+
+        new_embeds_list = []
+        new_mask_list = []
+        new_posids_list = []
+        top_rank_index_x_list = []
+        grad_scores_img_list = []
+
+        pos_is_3d = torch.is_tensor(position_ids) and position_ids.dim() == 3  # (3,B,S)
+
+        for i in range(bsz):
+            token_scores = grads[i].to(dtype_hidden).norm(p=2, dim=-1)  # (S,)
+            vis_scores = token_scores[img_start:img_end].detach().to(torch.float32)  # (img_len,)
+            grad_scores_img_list.append(vis_scores)
+
+            order = torch.argsort(vis_scores, descending=True)
+            k_keep = min(keep_length, int(vis_scores.numel()))
+
+            if k_keep <= 0:
+                top_local = torch.empty((0,), dtype=torch.long, device=device)
+            else:
+                if enable_nms:
+                    vis_feats = features[i, img_start:img_end, :].to(torch.float32)
+                    vis_feats = F.normalize(vis_feats, dim=-1)
+
+                    N_vis = vis_feats.size(0)
+                    if N_vis == 0:
+                        top_local = torch.empty((0,), dtype=torch.long, device=device)
+                    else:
+                        sim = torch.matmul(vis_feats, vis_feats.T)  # (N_vis, N_vis)
+                        neighbor = (sim >= tau).detach().cpu().numpy()
+                        order_np = order.detach().cpu().numpy()
+
+                        selected = []
+                        selected_set = set()
+                        suppressed = np.zeros(N_vis, dtype=bool)
+
+                        for idx in order_np:
+                            if len(selected) >= k_keep:
+                                break
+                            if suppressed[idx]:
+                                continue
+                            idx_int = int(idx)
+                            selected.append(idx_int)
+                            selected_set.add(idx_int)
+                            suppressed |= neighbor[idx_int]
+
+                        if len(selected) < k_keep:
+                            for idx in order_np:
+                                if len(selected) >= k_keep:
+                                    break
+                                idx_int = int(idx)
+                                if idx_int not in selected_set:
+                                    selected.append(idx_int)
+                                    selected_set.add(idx_int)
+
+                        top_local = torch.tensor(sorted(selected), device=device, dtype=torch.long)
+                else:
+                    top_local = order[:k_keep].to(device=device, dtype=torch.long)
+
+            top_global = (top_local + img_start).sort().values
+            top_rank_index_x_list.append(top_local)
+
+            start_index = img_end
+
+            new_embed = torch.cat(
+                [features[i, :img_start, :], features[i, top_global, :], features[i, start_index:, :]],
+                dim=0,
+            )
+            new_embeds_list.append(new_embed)
+
+            if torch.is_tensor(attention_mask) and attention_mask.dim() == 2:
+                new_m = torch.cat(
+                    [attention_mask[i, :img_start], attention_mask[i, top_global], attention_mask[i, start_index:]],
+                    dim=0,
+                )
+            else:
+                new_m = torch.ones((new_embed.shape[0],), dtype=torch.bool, device=device)
+            new_mask_list.append(new_m)
+
+            if pos_is_3d:
+                pos_i = torch.cat(
+                    [position_ids[:, i, :img_start], position_ids[:, i, top_global], position_ids[:, i, start_index:]],
+                    dim=-1,
+                )
+            else:
+                # rarely used in Qwen
+                pos_i = torch.cat(
+                    [position_ids[i, :img_start], position_ids[i, top_global], position_ids[i, start_index:]],
+                    dim=-1,
+                )
+            new_posids_list.append(pos_i)
+
+        # pad to max_len
+        max_len = max(x.shape[0] for x in new_embeds_list)
+
+        out_embeds = torch.zeros((bsz, max_len, hidden_dim), dtype=dtype_hidden, device=device)
+        out_mask = torch.zeros((bsz, max_len), dtype=torch.bool, device=device)
+
+        if pos_is_3d:
+            out_pos = torch.zeros((position_ids.shape[0], bsz, max_len), dtype=position_ids.dtype, device=device)
+        else:
+            out_pos = torch.zeros((bsz, max_len), dtype=position_ids.dtype, device=device)
+
+        for i in range(bsz):
+            L = new_embeds_list[i].shape[0]
+            out_embeds[i, :L] = new_embeds_list[i]
+            out_mask[i, :L] = new_mask_list[i]
+            if pos_is_3d:
+                out_pos[:, i, :L] = new_posids_list[i]
+            else:
+                out_pos[i, :L] = new_posids_list[i]
+
+        grad_scores_img = grad_scores_img_list[0] if bsz == 1 else torch.stack(grad_scores_img_list, dim=0)
+        if bsz == 1:
+            top_rank_index_x = top_rank_index_x_list[0]
+        else:
+            max_k = max(t.numel() for t in top_rank_index_x_list)
+            top_rank_index_x = torch.full((bsz, max_k), -1, dtype=torch.long, device=device)
+            for i, t in enumerate(top_rank_index_x_list):
+                if t.numel() > 0:
+                    top_rank_index_x[i, : t.numel()] = t
+
+        # respect original None behavior
+        if _position_ids is None:
+            out_pos = None
+        if _attention_mask is None:
+            out_mask = None
+
+        return out_pos, out_mask, out_embeds, grad_scores_img, top_rank_index_x
 
     
 
