@@ -22,7 +22,6 @@ import os
 import math
 import warnings
 from typing import List, Optional, Tuple, Union
-import numpy as np
 import copy
 import json
 import sys
@@ -1331,8 +1330,8 @@ class LlamaModel(LlamaPreTrainedModel):
             hidden_states=all_hidden_states,
             attentions=all_self_attns,
         ), labels
-        
-    def PIO_layer_prune(
+#To 64 tokens average,you can set [92, 54, 22][1,10,15]    
+    def layer_prune(
         self,
         cur_num,
         rank_layer,
@@ -1344,7 +1343,464 @@ class LlamaModel(LlamaPreTrainedModel):
         sum_visual_attention,
         indices_attention,
     ):
+        # ---------- 备份入参 ----------
+        _labels = labels
+        _position_ids = position_ids
+        _attention_mask = attention_mask
 
+        device = features.device
+        dtype_hidden = features.dtype
+        IGNORE = -100 if "IGNORE_INDEX" not in globals() else IGNORE_INDEX
+
+        # position_ids 缺省补齐
+        if position_ids is None:
+            position_ids = (
+                torch.arange(0, features.shape[1], dtype=torch.long, device=device)
+                .unsqueeze(0)
+                .expand(features.shape[0], -1)  # Expand to batch size
+            )
+
+        if getattr(self.config, "tokenizer_padding_side", "right") != "right":
+            raise ValueError(
+                f"Unexpected tokenizer_padding_side: {self.config.tokenizer_padding_side}"
+            )
+
+        batch_size = features.shape[0]
+
+        # 视觉区长度（当前阶段、下一阶段）
+        image_tokens = [
+            min(int(self.image_token_list[cur_num]), cur_image_token)
+            for cur_image_token in self.image_tokens
+        ]
+        keep_length = [
+            min(int(self.image_token_list[cur_num + 1]), cur_image_token)
+            for cur_image_token in self.image_tokens
+        ]
+        print(
+            f"[DEBUG] layer {rank_layer}: "
+            f"image_tokens(before) = {image_tokens}, "
+            f"keep_length(after) = {keep_length}"
+        )
+
+        # 缺省 mask/labels
+        if attention_mask is None:
+            attention_mask = torch.ones(
+                (batch_size, features.shape[1]),
+                dtype=torch.bool,
+                device=device,
+            )
+        else:
+            attention_mask = attention_mask.bool()
+
+        if labels is None:
+            labels = torch.full(
+                (batch_size, features.shape[1]),
+                IGNORE,
+                device=device,
+            )
+
+        # ---------- 优化点：提前获取 Output Head (避免循环内重复查找) ----------
+        def _get_output_head_func():
+            if (
+                hasattr(self, "_output_head_for_prune")
+                and self._output_head_for_prune is not None
+            ):
+                return self._output_head_for_prune
+
+            if hasattr(self, "lm_head") and self.lm_head is not None:
+                return self.lm_head
+
+            if hasattr(self, "get_output_embeddings"):
+                head = self.get_output_embeddings()
+                if head is not None:
+                    return head
+
+            raise RuntimeError("Cannot locate output head (lm_head/get_output_embeddings).")
+
+        output_head = _get_output_head_func()
+
+        # ==========================================================
+        # ✅ 仅当前层前向 + loss
+        # ==========================================================
+        def _loss_on_current_layer(
+            start_layer,
+            cur_hidden,
+            cur_attention_mask,
+            cur_position_ids,
+            cur_labels,
+        ):
+            """
+            支持 Batch 处理的 Loss 计算函数
+            """
+            loss_mode = "multi_pos"
+            force_pseudo = False  # 保留原变量（虽未使用，但避免未来改动冲突）
+            K_pos = 4
+            T_temp = 0.7
+            mix_alpha = 0.5
+
+            # 数值安全
+            K_pos = max(1, K_pos)
+            T_temp = max(1e-3, T_temp)
+            mix_alpha = float(min(max(mix_alpha, 0.0), 1.0))
+
+            # --------- 仅当前层前向到 logits (Batch processing) ----------
+            layer = self.layers[start_layer]
+            cur_hidden = layer(
+                hidden_states=cur_hidden,
+                attention_mask=None,
+                position_ids=cur_position_ids,
+                past_key_value=None,
+                output_attentions=False,
+                use_cache=False,
+            )[0]
+            logits = output_head(self.norm(cur_hidden))  # (B, S, V)
+
+            # --------- shift & 基本张量 ----------
+            shift_logits = logits[..., :-1, :].contiguous()  # (B, S-1, V)
+            IGNORE_LOCAL = -100 if "IGNORE_INDEX" not in globals() else IGNORE_INDEX
+
+            # 如果 attention_mask 提供，则也右移对齐
+            if cur_attention_mask is not None:
+                shift_mask = cur_attention_mask[..., 1:].contiguous().bool()  # (B, S-1)
+            else:
+                shift_mask = None
+
+            # ========== “无标签或强制伪监督”模式 ==========
+            B, S1, V = shift_logits.shape
+            shift_logits_f = shift_logits.float()
+
+            # 构造“最后 K_pos 个有效位”的监督 mask
+            pos_mask = torch.zeros((B, S1), dtype=torch.bool, device=shift_logits.device)
+
+            # 向量化构造 pos_mask 比较困难，这里维持原有逻辑的小循环，相比 forward 开销极小
+            if shift_mask is not None:
+                valid_len = shift_mask.long().sum(dim=1)  # (B,)
+                for b in range(B):
+                    L = int(valid_len[b].item())
+                    if L <= 0:
+                        pos_mask[b, S1 - 1] = True
+                        continue
+                    for t in range(K_pos):
+                        k = max(0, min(S1 - 1, L - 1 - t))
+                        pos_mask[b, k] = True
+            else:
+                for b in range(B):
+                    for t in range(K_pos):
+                        k = max(0, S1 - 1 - t)
+                        pos_mask[b, k] = True
+
+            # ---------- 不同模式 (Batch Compatible) ----------
+            if loss_mode == "orig":
+                pseudo = shift_logits_f.detach().argmax(dim=-1)
+                ignore_fill = torch.full_like(pseudo, IGNORE_LOCAL)
+                shift_labels = torch.where(pos_mask, pseudo, ignore_fill)
+                loss = F.cross_entropy(
+                    shift_logits_f.view(-1, V),
+                    shift_labels.view(-1),
+                    ignore_index=IGNORE_LOCAL,
+                    reduction="mean",
+                )
+                return loss
+
+            elif loss_mode == "multi_pos":
+                pseudo = shift_logits_f.detach().argmax(dim=-1)
+                ignore_fill = torch.full_like(pseudo, IGNORE_LOCAL)
+                shift_labels = torch.where(pos_mask, pseudo, ignore_fill)
+                loss = F.cross_entropy(
+                    shift_logits_f.view(-1, V),
+                    shift_labels.view(-1),
+                    ignore_index=IGNORE_LOCAL,
+                    reduction="mean",
+                )
+                return loss
+
+            elif loss_mode == "soft_kd":
+                logp = F.log_softmax(shift_logits_f / T_temp, dim=-1)
+                with torch.no_grad():
+                    p_t = F.softmax(shift_logits_f / T_temp, dim=-1)
+
+                kl = F.kl_div(logp, p_t, reduction="none").sum(-1) * (T_temp * T_temp)
+                if pos_mask is not None:
+                    denom = pos_mask.sum().clamp_min(1)
+                    loss = (kl.masked_fill(~pos_mask, 0.0).sum() / denom).float()
+                else:
+                    loss = kl.mean().float()
+                return loss
+
+            elif loss_mode == "hybrid":
+                pseudo = shift_logits_f.detach().argmax(dim=-1)
+                ignore_fill = torch.full_like(pseudo, IGNORE_LOCAL)
+                shift_labels = torch.where(pos_mask, pseudo, ignore_fill)
+
+                ce = F.cross_entropy(
+                    shift_logits_f.view(-1, V),
+                    shift_labels.view(-1),
+                    ignore_index=IGNORE_LOCAL,
+                    reduction="mean",
+                )
+
+                logp = F.log_softmax(shift_logits_f / T_temp, dim=-1)
+                with torch.no_grad():
+                    p_t = F.softmax(shift_logits_f / T_temp, dim=-1)
+
+                kl = F.kl_div(logp, p_t, reduction="none").sum(-1) * (T_temp * T_temp)
+                if pos_mask is not None:
+                    denom = pos_mask.sum().clamp_min(1)
+                    kl = (kl.masked_fill(~pos_mask, 0.0).sum() / denom).float()
+                else:
+                    kl = kl.mean().float()
+
+                loss = mix_alpha * ce + (1.0 - mix_alpha) * kl
+                return loss
+
+            else:
+                # fallback
+                pseudo = shift_logits_f.detach().argmax(dim=-1)
+                ignore_fill = torch.full_like(pseudo, IGNORE_LOCAL)
+                shift_labels = torch.where(pos_mask, pseudo, ignore_fill)
+                loss = F.cross_entropy(
+                    shift_logits_f.view(-1, V),
+                    shift_labels.view(-1),
+                    ignore_index=IGNORE_LOCAL,
+                    reduction="mean",
+                )
+                return loss
+
+        # ==========================================================
+        # 🚀 优化一：Batch 级并行梯度计算 (替代循环内的逐个计算)
+        # ==========================================================
+        batch_grads = None
+
+        # 检查是否需要剪枝（如果有任意一个样本需要剪枝，则进行 Batch 计算）
+        needs_pruning = False
+        for i in range(batch_size):
+            img_len = image_tokens[i] if i < len(image_tokens) else 0
+            k_keep = keep_length[i] if i < len(keep_length) else 0
+            if img_len > 0 and k_keep > 0 and k_keep < img_len:
+                needs_pruning = True
+                break
+
+        if needs_pruning:
+            with torch.enable_grad():
+                target_dtype = next(self.parameters()).dtype
+                # detach 防止梯度回传到前一层，只保留当前输入的梯度
+                probe_in = features.to(target_dtype).detach()
+                probe_in.requires_grad_(True)
+
+                try:
+                    from torch import amp as _amp
+                    ac = _amp.autocast(device_type="cuda", dtype=target_dtype)
+                except Exception:
+                    ac = nullcontext()
+
+                with torch.set_grad_enabled(True), ac:
+                    # 一次性计算整个 Batch 的 Loss
+                    total_loss = _loss_on_current_layer(
+                        rank_layer,
+                        probe_in,
+                        attention_mask,
+                        position_ids,
+                        labels if _labels is not None else None,
+                    )
+
+                # 一次性计算整个 Batch 的梯度
+                batch_grads = torch.autograd.grad(
+                    total_loss,
+                    probe_in,
+                    retain_graph=False,
+                    create_graph=False,
+                    allow_unused=False,
+                )[0]
+                # batch_grads shape: (Batch, Seq_Len, Hidden_Dim)
+
+        # ---------- 主循环 (仅保留 NMS 和 索引选择) ----------
+        features_list = []
+        attention_mask_list = []
+        labels_list = []
+
+        for i in range(batch_size):
+            img_start = self.image_token_posi[i]
+            img_len = image_tokens[i] if i < len(image_tokens) else 0
+            k_keep = keep_length[i] if i < len(keep_length) else 0
+
+            # 若当前样本无图像 token 或不需要剪
+            if img_start == -1 or img_len <= 0 or k_keep <= 0 or k_keep >= img_len:
+                features_list.append(features[i])
+                attention_mask_list.append(attention_mask[i])
+                labels_list.append(labels[i])
+                continue
+
+            # 🚀 从预计算的 Batch 梯度中取出当前样本的梯度
+            if batch_grads is not None:
+                grad = batch_grads[i].to(dtype_hidden)
+            else:
+                # 理论上不应走到这里，如果走到说明逻辑有误，给个兜底
+                grad = torch.zeros_like(features[i])
+
+            token_scores = grad.norm(p=2, dim=-1)  # (S,)
+            vis_scores = token_scores[img_start : img_start + img_len]  # (N_vis,)
+
+            # ---------- 选择策略：梯度 + NMS (原样保留) ----------
+            enable_nms = True
+            k_keep_local = min(k_keep, vis_scores.numel())
+            order = torch.argsort(vis_scores, descending=True)
+
+            if enable_nms:
+                tau = 0.8
+
+                # 1. 特征准备（保持在 GPU）
+                vis_feats = features[i][img_start : img_start + img_len, :].to(torch.float32)
+                vis_feats = F.normalize(vis_feats, dim=-1)
+
+                N_vis = vis_feats.size(0)
+                if N_vis == 0 or k_keep_local == 0:
+                    selected = []
+                else:
+                    # 2. 一次性算出所有两两相似度
+                    sim_matrix = torch.matmul(vis_feats, vis_feats.T)
+                    neighbor_mask = sim_matrix >= tau  # [N_vis, N_vis]
+
+                    # 将关键数据转至 CPU/Numpy，加速循环部分
+                    neighbor_mask_np = neighbor_mask.cpu().numpy()
+                    order_np = order.cpu().numpy()
+
+                    selected = []
+                    selected_set = set()
+                    suppressed_np = np.zeros(N_vis, dtype=bool)
+
+                    # 第一轮：严格 NMS
+                    for idx in order_np:
+                        if len(selected) >= k_keep_local:
+                            break
+                        if suppressed_np[idx]:
+                            continue
+
+                        idx_int = int(idx)
+                        selected.append(idx_int)
+                        selected_set.add(idx_int)
+
+                        suppressed_np |= neighbor_mask_np[idx]
+
+                    # 第二轮：若数量不足则补齐
+                    if len(selected) < k_keep_local:
+                        for idx in order_np:
+                            if len(selected) >= k_keep_local:
+                                break
+                            idx_int = int(idx)
+                            if idx_int not in selected_set:
+                                selected.append(idx_int)
+                                selected_set.add(idx_int)
+            else:
+                # 纯 Top-K（无 NMS）
+                top_idx_grad = order[:k_keep_local]
+                selected = top_idx_grad.tolist()
+
+            # ---------- 重组序列 ----------
+            top_local = torch.tensor(sorted(selected), device=features.device)
+            top_global = (top_local + img_start).sort().values
+            start_index = img_start + img_len
+
+            new_input_embeds = torch.cat(
+                [
+                    features[i][:img_start, :],
+                    features[i][top_global, :],
+                    features[i][start_index:, :],
+                ],
+                dim=0,
+            )
+            new_labels = torch.cat(
+                [
+                    labels[i][:img_start],
+                    labels[i][top_global],
+                    labels[i][start_index:],
+                ],
+                dim=0,
+            )
+            new_attention_mask = torch.cat(
+                [
+                    attention_mask[i][:img_start],
+                    attention_mask[i][top_global],
+                    attention_mask[i][start_index:],
+                ],
+                dim=0,
+            )
+
+            features_list.append(new_input_embeds)
+            attention_mask_list.append(new_attention_mask)
+            labels_list.append(new_labels)
+
+        # ---------- 对齐与输出 ----------
+        tokenizer_model_max_length = getattr(
+            self.config,
+            "tokenizer_model_max_length",
+            2048,
+        )
+
+        # 截断
+        if tokenizer_model_max_length is not None:
+            new_input_embeds = [x[:tokenizer_model_max_length] for x in features_list]
+            new_attention_mask = [
+                x[:tokenizer_model_max_length] for x in attention_mask_list
+            ]
+            new_labels = [x[:tokenizer_model_max_length] for x in labels_list]
+        else:
+            new_input_embeds = features_list
+            new_attention_mask = attention_mask_list
+            new_labels = labels_list
+
+        # 🚀 优化二：预分配输出张量，避免循环内 torch.cat
+        max_len = max(x.shape[0] for x in new_input_embeds)
+
+        # 准备输出容器 (预分配)
+        position_ids_out = torch.zeros(
+            (batch_size, max_len),
+            dtype=position_ids.dtype,
+            device=device,
+        )
+        out_embeds = torch.zeros(
+            (batch_size, max_len, features.shape[-1]),
+            dtype=dtype_hidden,
+            device=device,
+        )
+        out_mask = torch.zeros(
+            (batch_size, max_len),
+            dtype=new_attention_mask[0].dtype,
+            device=device,
+        )
+        out_labels = torch.full(
+            (batch_size, max_len),
+            IGNORE,
+            dtype=labels.dtype,
+            device=device,
+        )
+
+        # 填充数据
+        for i, (cur_embed, cur_lbl, cur_msk) in enumerate(
+            zip(new_input_embeds, new_labels, new_attention_mask)
+        ):
+            cur_len = cur_embed.shape[0]
+
+            out_embeds[i, :cur_len] = cur_embed
+            out_labels[i, :cur_len] = cur_lbl
+            out_mask[i, :cur_len] = cur_msk
+
+            # Position Ids 逻辑
+            cur_valid = cur_msk.sum().item()
+            position_ids_out[i, :cur_valid] = torch.arange(
+                0, cur_valid, dtype=position_ids.dtype, device=device
+            )
+
+        # 处理返回逻辑
+        if _position_ids is None:
+            position_ids_out = None
+        if _labels is None:
+            out_labels = None
+        if _attention_mask is None:
+            out_mask = None
+        else:
+            out_mask = out_mask.to(dtype=_attention_mask.dtype)
+
+        return position_ids_out, out_mask, out_embeds, out_labels
 
 
     
