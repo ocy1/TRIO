@@ -580,7 +580,8 @@ This results in an average visual token retention ratio of 11.1% across the 28 L
 
 
 ## Citation
-If you find our work useful for your research, please consider citing:
+If you find our work helpful or use our code in your research, please consider citing our paper:
+
 
 ```bibtex
 @misc{zhang2026triotokenreductioninferenceobjective,
